@@ -74,11 +74,28 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         public void run() {
             while (true) {
                 try {
-                    VoucherOrder order = orderTasks.take();
+                    VoucherOrder voucherOrder = orderTasks.take();
+                    handleVoucherOrder(voucherOrder);
                 } catch (Exception e) {
                     log.error("处理订单异常", e);
                 }
             }
+        }
+    }
+
+    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+        Long userId = voucherOrder.getUserId();
+        RLock lock = redissonClient.getLock("lock:order" + userId);
+        boolean isLock = lock.tryLock();
+        if (!isLock) {
+            //     获取锁失败，返回错误或重试
+            log.error("用户{}下单失败，不允许重复下单", userId);
+        }
+
+        try {
+            proxy.createVoucherOrder(voucherOrder);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -120,6 +137,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     //
     // }
 
+    private IVoucherOrderService proxy;
+
     @Override
     public Result seckillVoucher(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
@@ -140,34 +159,33 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         voucherOrder.setVoucherId(voucherId);
         // 放入阻塞队列
         orderTasks.add(voucherOrder);
+        proxy = (IVoucherOrderService) AopContext.currentProxy();
+
 
         return Result.ok(orderId);
     }
 
     @Transactional
-    public Result createVoucherOrder(Long voucherId) {
+    public void createVoucherOrder(VoucherOrder voucherOrder) {
         // 一人一单
         Long userId = UserHolder.getUser().getId();
         // 查询订单
-        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
         // 判断订单是否存在
         if (count > 0) {
-            return Result.fail("您已购买过该优惠卷");
+            log.error("用户{}下单失败，不允许重复下单", userId);
+            return;
         }
 
         // 扣减库存
-        boolean success = seckillVoucherService.update().setSql("stock = stock - 1").eq("voucher_id", voucherId).gt("stock", 0).update();
+        boolean success = seckillVoucherService.update().setSql("stock = stock - 1").eq("voucher_id", voucherOrder.getVoucherId()).gt("stock", 0).update();
         if (!success) {
-            return Result.fail("扣减库存失败");
+            log.error("用户{}下单失败，扣减库存失败", userId);
+            return;
         }
         // 创建订单
 
-        VoucherOrder voucherOrder = new VoucherOrder();
-        long orderId = redisIdWorker.nextId("order");
-        voucherOrder.setId(orderId);
-        voucherOrder.setUserId(userId);
-        voucherOrder.setVoucherId(voucherId);
+
         save(voucherOrder);
-        return Result.ok(orderId);
     }
 }
